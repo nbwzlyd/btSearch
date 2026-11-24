@@ -13,7 +13,8 @@
 - **种子质量徽章** 🌱*N* 种 · 🔥*M* 下载中：不走 DHT（国内网络境外 UDP 6881 基本不可用），
   而是取 magnet 里的 `tr=` 做 HTTP tracker announce，解析 bencode 的 `complete` / `incomplete`。
 - **清晰度徽章**：从标题正则解析 8K / 4K / 1080P / 720P / 杜比视界 / HDR / HEVC / 全景声。
-- **边下边播**：点结果里「⚡ 在线预览」即可直接播放（jlibtorrent 拉流 + ExoPlayer 解码）。
+- **边下边播**：点结果里「⚡ 在线预览」即可直接播放（libtorrent4j 拉流 + ExoPlayer 解码）。
+  播放页控制条为**自绘并固定在屏幕底部**（不遮挡画面），带全屏按钮（横屏 + 沉浸式隐藏系统栏）。
 - 支持一键复制磁力、调用迅雷下载。
 
 ## 工程结构
@@ -40,7 +41,7 @@ app/src/main/kotlin/com/aifindres/lite/
 └── play/                    # 边下边播
     ├── TorrentStreamSession.kt  # jlibtorrent 会话：拉元数据、选最大视频文件、顺序下载
     ├── LocalTorrentServer.kt    # 127.0.0.1 HTTP 服务，支持 Range/HEAD，按分片阻塞等待
-    └── PlayActivity.kt          # ExoPlayer 播放本地流转出的视频
+    └── PlayActivity.kt          # ExoPlayer 播放 + 自绘底部控制条（进度/±10s/播放暂停/全屏）
 ```
 
 ## 构建
@@ -106,6 +107,16 @@ Maven 坐标 `org.libtorrent4j:libtorrent4j:2.1.0-39`，原生库在
    进播放页只会白等 60 秒超时，入口处要先校验（`MagnetItem.infoHash() == null` 就拦下）。
 9. **不要把 `iso` 当视频扩展名**：ISO 镜像不是视频，ExoPlayer 会报
    `UnrecognizedInputFormatException`。
+10. **media3 内置控制器不能用**：`exo_player_control_view.xml` 里
+    `exo_center_controls`（上一集/快退/播放/快进/下一集）是 `layout_gravity="center"`，
+    按钮直接压在画面正中间；而且 `@id/exo_*`、`@style/ExoStyledControls.*` 都不在
+    media3-ui 的 `public.txt` 里，自定义 layout 引不到。加上它默认 `exo_fullscreen`
+    invisible、要注册 `setFullscreenButtonClickListener` 才显示。结论：
+    `app:use_controller="false"`，控制条自绘 + 自己实现全屏。
+11. **全屏别只调 `requestedOrientation`**：还要
+    `WindowCompat.setDecorFitsSystemWindows(window, false)` +
+    `WindowInsetsControllerCompat.hide(systemBars())`，否则状态栏/导航栏还在。
+    退出全屏要成对还原（`SCREEN_ORIENTATION_UNSPECIFIED` + `show(systemBars())`）。
 
 ## 真机验证记录
 
@@ -114,6 +125,12 @@ Maven 坐标 `org.libtorrent4j:libtorrent4j:2.1.0-39`，原生库在
 - 清空缓存后播放 263MB 的 Big Buck Bunny，**下载到 45% 时画面已经在播**，
   91% / 100% 全程流畅，下载速度峰值 14.9 MB/s；
 - release 包（19MB，含 arm64+v7a 两个 libtorrent4j.so）同样验证通过。
+
+Android 11 x86_64 模拟器（emulator-5554，另带 x86_64 .so 便于本机验证）实测 v2.2：
+- 元数据 1.7 秒到手，画面正常播放；
+- 底部控制条显示 `01:36 / 10:34`、暂停图标随状态切换；
+- 点全屏 → 横屏 + 系统栏隐藏、画面按比例铺满、按钮仍在底部；再点 → 正常竖屏还原；
+- ±10s 与进度条拖动均生效。
 
 ## License
 

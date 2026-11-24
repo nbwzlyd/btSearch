@@ -1,19 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/rootPlay"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000">
 
+    <!-- 关闭内置控制器：它把播放/快进按钮摆在画面正中间，遮挡视频 -->
     <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         app:resize_mode="fit"
         app:show_buffering="never"
-        app:use_controller="true" />
+        app:use_controller="false" />
 
+    <!-- 顶部信息条（标题 + 下载进度/速度），只在控件可见时显示 -->
     <LinearLayout
+        android:id="@+id/topBar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="top"
@@ -41,6 +45,7 @@
             android:text="" />
     </LinearLayout>
 
+    <!-- 准备阶段的进度条（垂直居中，仅 BT 拉元数据/缓冲时显示） -->
     <ProgressBar
         android:id="@+id/playProgress"
         style="?android:attr/progressBarStyleHorizontal"
@@ -49,4 +54,98 @@
         android:layout_gravity="center_vertical"
         android:max="100"
         android:progress="0" />
+
+    <!-- ★ 底部控制条：所有操作按钮都放这里，绝不遮挡画面中心 -->
+    <LinearLayout
+        android:id="@+id/bottomBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:background="#B3000000"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:paddingTop="6dp"
+        android:paddingBottom="6dp">
+
+        <!-- 播放进度 + 时间 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:id="@+id/tvCurTime"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:textSize="11sp"
+                android:fontFamily="monospace"
+                android:text="00:00" />
+
+            <SeekBar
+                android:id="@+id/seekBar"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="1000"
+                android:paddingStart="8dp"
+                android:paddingEnd="8dp" />
+
+            <TextView
+                android:id="@+id/tvTotalTime"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:textSize="11sp"
+                android:fontFamily="monospace"
+                android:text="00:00" />
+        </LinearLayout>
+
+        <!-- 按钮行：后退 / 播放暂停 / 前进 / 全屏 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingTop="2dp">
+
+            <ImageButton
+                android:id="@+id/btnReplay"
+                android:layout_width="0dp"
+                android:layout_height="44dp"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackground"
+                android:src="@drawable/ic_replay10"
+                android:contentDescription="后退10秒" />
+
+            <ImageButton
+                android:id="@+id/btnPlayPause"
+                android:layout_width="0dp"
+                android:layout_height="44dp"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackground"
+                android:src="@drawable/ic_pause"
+                android:contentDescription="暂停" />
+
+            <ImageButton
+                android:id="@+id/btnForward"
+                android:layout_width="0dp"
+                android:layout_height="44dp"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackground"
+                android:src="@drawable/ic_forward10"
+                android:contentDescription="前进10秒" />
+
+            <ImageButton
+                android:id="@+id/btnFullscreen"
+                android:layout_width="0dp"
+                android:layout_height="44dp"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackground"
+                android:src="@drawable/ic_fullscreen"
+                android:contentDescription="全屏" />
+        </LinearLayout>
+    </LinearLayout>
 </FrameLayout>
