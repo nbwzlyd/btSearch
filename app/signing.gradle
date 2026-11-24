@@ -1,18 +1,29 @@
-// Release signing: reuse the standard debug keystore so the side-loaded APK
-// can be updated in place (the original app's key is lost with its source).
+// Release signing.
+//
+// 用项目自带的 btdownload.jks（不是 ~/.android/debug.keystore），原因：
+// debug.keystore 在多台机器上会被各自重新生成，签名指纹不一致 →
+// 换机器/换环境出的包无法覆盖安装（INSTALL_FAILED_UPDATE_INCOMPATIBLE）。
+// 把 keystore 放进仓库（app/btdownload.jks）才能保证任何机器打包都用同一把钥匙。
+//
+// 口令统一为 btdownload；alias 也是 btdownload。
+// ⚠️ 这把钥匙一旦换掉，覆盖安装必然失败，只能卸载重装（会清掉 App 数据）。
 android {
     signingConfigs {
         release {
-            storeFile file(System.getProperty("user.home") + "/.android/debug.keystore")
-            storePassword "android"
-            keyAlias "androiddebugkey"
-            keyPassword "android"
+            storeFile file("btdownload.jks")
+            storePassword "btdownload"
+            keyAlias "btdownload"
+            keyPassword "btdownload"
         }
     }
     buildTypes {
         release {
             signingConfig signingConfigs.release
             minifyEnabled false
+        }
+        // debug 也用同一把钥匙：否则 debug/release 交替装机永远互相冲突
+        debug {
+            signingConfig signingConfigs.release
         }
     }
 }
