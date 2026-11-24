@@ -236,7 +236,14 @@ class LocalTorrentServer(private val session: TorrentStreamSession) {
             }
             try { Thread.sleep(120) } catch (e: InterruptedException) { return false }
         }
-        Log.w(TAG, "waitForPiece gave up: piece=$piece offset=$offsetInFile")
+        val conn = session.connected()
+        val hint = try { session.healthHint(conn[0], conn[1]) } catch (t: Throwable) { null }
+        Log.w(
+            TAG,
+            "waitForPiece gave up: piece=$piece offset=$offsetInFile " +
+                "peers=${conn[0]} seeds=${conn[1]} health=${try { session.health(conn[0], conn[1]) } catch (t: Throwable) { "?" }}" +
+                (if (hint != null) " hint=$hint" else "")
+        )
         return false
     }
 }

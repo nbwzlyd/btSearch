@@ -253,11 +253,19 @@ class MagnetFragment : Fragment(R.layout.fragment_magnet) {
             labels.add("复制详情链接")
             actions.add { copy(item.url, "详情链接") }
         }
-        android.app.AlertDialog.Builder(requireContext())
+        val builder = android.app.AlertDialog.Builder(requireContext())
             .setTitle(item.title)
             .setItems(labels.toTypedArray()) { _, which -> actions[which].invoke() }
             .setNegativeButton("取消", null)
-            .show()
+        // ★ 冷门种预警：tracker 探测拿到做种数（0 表示还没探测/未知，1~2 是真的没人做种）。
+        //   这种种实测只有 40KB/s，边下边播必然超时，提前说一句比进去干等 45 秒好。
+        if (item.seeders in 1..2) {
+            builder.setMessage(
+                "这个种只报告了 ${item.seeders} 个做种，边下边播多半会卡。" +
+                    "建议用「用迅雷下载」，或换个做种多的资源。"
+            )
+        }
+        builder.show()
     }
 
     /** 打开「边下边播」预览页 */

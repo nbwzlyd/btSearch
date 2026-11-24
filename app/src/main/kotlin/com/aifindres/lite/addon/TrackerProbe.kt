@@ -181,7 +181,25 @@ object TrackerProbe {
      * 直接注入 torrent（add_torrent_params.set_peers），元数据几秒就能拿到。
      */
     fun fetchPeers(infoHashHex: String, magnet: String, timeoutMs: Int, maxPeers: Int = 40): List<Peer> {
+        return fetchPeersEx(infoHashHex, magnet, timeoutMs, maxPeers).peers
+    }
+
+    /**
+     * 同 [fetchPeers]，但额外带出 tracker 报告的种子/下载人数。
+     *
+     * 边下边播时这个数字非常有用：tracker 说 `complete=1` 的种子，实测就是
+     * 40KB/s 龟速、8MiB 一片要 200 秒、必然超过我们的等待上限而失败。
+     * 拿到它就能在卡住时告诉用户「这个种只有 1 个做种」，而不是干等 45 秒后报个笼统的错。
+     */
+    fun fetchPeersEx(
+        infoHashHex: String,
+        magnet: String,
+        timeoutMs: Int,
+        maxPeers: Int = 40,
+    ): PeerResult {
         val out = LinkedHashMap<String, Peer>() // "ip:port" 去重
+        var bestSeed = 0
+        var bestLeech = 0
         val trackers = probeTrackers(magnet, 8)
         val deadline = System.currentTimeMillis() + timeoutMs
         for (base in trackers) {
@@ -194,15 +212,25 @@ object TrackerProbe {
                 android.util.Log.i(TAG, "fetchPeers ${base.take(40)} err: ${e.message}")
                 null
             } ?: continue
+            // 同一个响应里就带 complete/incomplete，顺手解析，不额外发请求。
+            val counts = parseCounts(String(raw, Charsets.ISO_8859_1))
+            if (counts[0] > bestSeed) bestSeed = counts[0]
+            if (counts[1] > bestLeech) bestLeech = counts[1]
             for (p in parseCompactPeers(raw)) {
                 val k = "${p.ip}:${p.port}"
                 if (!out.containsKey(k)) out[k] = p
                 if (out.size >= maxPeers) break
             }
         }
-        android.util.Log.i(TAG, "fetchPeers ${infoHashHex.take(12)}… -> ${out.size} peers")
-        return out.values.toList()
+        android.util.Log.i(
+            TAG,
+            "fetchPeers ${infoHashHex.take(12)}… -> ${out.size} peers (seeds=$bestSeed leech=$bestLeech)"
+        )
+        return PeerResult(out.values.toList(), bestSeed, bestLeech)
     }
+
+    /** [fetchPeersEx] 的结果：peer 列表 + tracker 报告的做种数/下载中人数。 */
+    data class PeerResult(val peers: List<Peer>, val seeders: Int, val leechers: Int)
 
     data class Peer(val ip: String, val port: Int)
 

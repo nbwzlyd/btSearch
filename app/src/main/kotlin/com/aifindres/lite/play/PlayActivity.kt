@@ -346,6 +346,17 @@ class PlayActivity : AppCompatActivity() {
         if (!playbackReady && progressBar != null && progressBar!!.visibility != View.GONE) {
             progressBar?.progress = pct.toInt()
         }
+        // ★ 健康度预警：只在「还没起播」或「起播后卡在缓冲」时把原因摆到标题上。
+        //   死种（tracker 说 0 个做种、一个 peer 都连不上）以前只能干等 45 秒再看到
+        //   「播放出错」，用户根本不知道是种的问题；现在直接把判断结论说出来。
+        val conn = try { sess.connected() } catch (t: Throwable) { intArrayOf(0, 0) }
+        val hint = try { sess.healthHint(conn[0], conn[1]) } catch (t: Throwable) { null }
+        if (hint != null) {
+            val stalled = !playbackReady || player?.playbackState == Player.STATE_BUFFERING
+            if (stalled) setTip(hint)
+        } else if (playbackReady) {
+            setTip(sess.torrentName)
+        }
     }
 
     private fun updateSeekBar() {

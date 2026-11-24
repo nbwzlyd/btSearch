@@ -109,6 +109,21 @@ class TorrentStreamSession(
     /** 失败原因（人类可读），ready=false 时给 UI 展示 */
     @Volatile var failReason: String? = null
         private set
+    /**
+     * tracker 报告的做种数（-1 = 还没探测完 / 全部 tracker 都死了）。
+     *
+     * 用途是「健康度预警」：做种数 0~1 的种子实测只有 40KB/s，一片 8MiB 要 200 秒，
+     * 必然超过 LocalTorrentServer 的等待上限而失败。提前把它告诉用户，
+     * 比让用户干等 45 秒再看到一句「加载失败」有用得多。
+     */
+    @Volatile var seedersHint: Int = -1
+        private set
+    /** tracker 报告的下载中人数，-1 = 未知 */
+    @Volatile var leechersHint: Int = -1
+        private set
+    /** tracker 探测是否已完成（含全部失败的情况） */
+    @Volatile var probeFinished: Boolean = false
+        private set
 
     /** 视频文件在整块存储里的起始偏移（用于把文件内偏移换算成分片号） */
     @Volatile private var fileOffset: Long = 0
@@ -179,12 +194,22 @@ class TorrentStreamSession(
             val probeThread = if (hashForPeers != null) {
                 Thread({
                     try {
-                        probePeers = TrackerProbe.fetchPeers(hashForPeers, magnet, 8000, 40)
+                        // 用 fetchPeersEx 顺手把 tracker 报的做种数带出来（同一个响应，
+                        // 不额外发请求），供「健康度预警」使用。
+                        val r = TrackerProbe.fetchPeersEx(hashForPeers, magnet, 8000, 40)
+                        probePeers = r.peers
+                        seedersHint = r.seeders
+                        leechersHint = r.leechers
                     } catch (t: Throwable) {
                         Log.w(TAG, "fetchPeers failed: ${t.message}")
                     }
                     probeDone.set(true)
-                    Log.i(TAG, "fetched ${probePeers.size} peers from http trackers (async)")
+                    probeFinished = true
+                    Log.i(
+                        TAG,
+                        "fetched ${probePeers.size} peers from http trackers (async), " +
+                            "seeds=${seedersHint} leech=${leechersHint}"
+                    )
                 }, "tracker-probe").apply {
                     isDaemon = true
                     start()
@@ -473,6 +498,16 @@ class TorrentStreamSession(
         false
     }
 
+    /** 当前实际连上的 peer 数 / 其中的做种数；拿不到返回 [0, 0]。 */
+    fun connected(): IntArray {
+        return try {
+            val st = handle?.status() ?: return intArrayOf(0, 0)
+            intArrayOf(st.numPeers(), st.numSeeds())
+        } catch (t: Throwable) {
+            intArrayOf(0, 0)
+        }
+    }
+
     fun progress(): TorrentProgress {
         val h = handle ?: return TorrentProgress(0, videoSize, 0, false)
         return try {
@@ -518,6 +553,53 @@ class TorrentStreamSession(
         val rate: Long,
         val finished: Boolean,
     )
+
+    /**
+     * 种子健康度（给 UI 做预警）。
+     *
+     * 判定用的是**实际连上的 peer 数**与 tracker 报告的做种数两者中最坏的那个：
+     *  tracker 说 7 个种、实际只连上 1 个的情况太常见了（对方 NAT 后不响应 handshake），
+     *  真正决定下载速度的是「连上了几个能传数据的」。
+     */
+    enum class Health { UNKNOWN, GOOD, WEAK, DEAD }
+
+    /**
+     * 评估当前能不能播。
+     *
+     * 判定基准是**实测速率**而非「连上了几个」：老种实测 tracker 报 9 个做种、
+     * 实际只连上 1 个、速率 48KB/s（一片 8MiB 要 200 秒），这种情况就是不能流式播。
+     * 反过来活种 3~5 秒内就能跑到 10MB/s 以上。
+     *
+     * @param havePeers 实际连上的 peer 数
+     * @param seeders  tracker 报告的做种数（-1 未知）
+     */
+    fun health(havePeers: Int, haveSeeds: Int): Health {
+        // 已经下完 / 正在下，就别报警了
+        val p = progress()
+        if (p.finished) return Health.GOOD
+        val known = probeFinished || havePeers > 0
+        if (!known) return Health.UNKNOWN
+        // 实测速率够快就是好种（活种 3~5 秒内能到 10MB/s+）
+        if (p.rate >= 512 * 1024) return Health.GOOD
+        if (havePeers >= 4) return Health.GOOD
+        if (havePeers >= 1 || seedersHint >= 1) return Health.WEAK
+        return Health.DEAD
+    }
+
+    /** 给用户看的一句话说明；GOOD 返回 null。 */
+    fun healthHint(havePeers: Int, haveSeeds: Int): String? {
+        return when (health(havePeers, haveSeeds)) {
+            Health.GOOD, Health.UNKNOWN -> null
+            Health.WEAK -> {
+                val bits = ArrayList<String>()
+                if (seedersHint > 0) bits.add("做种 ${seedersHint}")
+                if (havePeers > 0) bits.add("已连 $havePeers 个 peer")
+                val detail = if (bits.isEmpty()) "" else "（${bits.joinToString("，")}）"
+                "这个种子比较冷门$detail，可能很慢。想要秒播可以把链接发到迅雷/PikPak 这类有云端缓存的离线下载。"
+            }
+            Health.DEAD -> "连不上任何 peer，这个种可能已经没人做种了。换个资源，或改用迅雷/PikPak 的离线下载。"
+        }
+    }
 
     // ---- 缓存 ----
 
