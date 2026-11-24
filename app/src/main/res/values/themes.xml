@@ -1,0 +1,15 @@
+<resources>
+    <style name="Theme.ResFind" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:statusBarColor">?colorSurface</item>
+        <item name="colorPrimary">@color/brand</item>
+    </style>
+
+    <!-- 播放页：全屏黑底、无标题栏 -->
+    <style name="Theme.ResFind.Player" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:statusBarColor">#000000</item>
+        <item name="android:navigationBarColor">#000000</item>
+        <item name="android:windowBackground">#000000</item>
+        <item name="colorPrimary">@color/brand</item>
+    </style>
+
+</resources>

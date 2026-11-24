@@ -1,0 +1,21 @@
+# Gradle
+.gradle/
+build/
+app/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Logs / temp
+*.log
+*.hprof
+captures/
+
+# 冗余的 ABI 版 jlibtorrent jar：里面只有 lib/<abi>/libjlibtorrent-1.2.0.18.so，
+# 与 app/src/main/jniLibs/ 下的 .so 文件完全同源（sha256 一致）。
+# .so 已直接提交在 jniLibs，这两个 jar 不再入库存，避免仓库无谓膨胀。
+app/libs/jlibtorrent-android-arm-1.2.0.18.jar
+app/libs/jlibtorrent-android-arm64-1.2.0.18.jar

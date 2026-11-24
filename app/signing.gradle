@@ -1,0 +1,18 @@
+// Release signing: reuse the standard debug keystore so the side-loaded APK
+// can be updated in place (the original app's key is lost with its source).
+android {
+    signingConfigs {
+        release {
+            storeFile file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+        }
+    }
+}

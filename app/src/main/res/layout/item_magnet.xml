@@ -1,0 +1,34 @@
+<com.google.android.material.card.MaterialCardView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:focusable="true" android:clickable="true"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:layout_marginTop="6dp" android:layout_marginBottom="2dp"
+    android:layout_marginStart="12dp" android:layout_marginEnd="12dp"
+    app:cardCornerRadius="12dp" app:cardElevation="0dp"
+    app:strokeColor="?colorOutlineVariant" app:strokeWidth="1dp">
+    <LinearLayout android:orientation="vertical" android:padding="12dp"
+        android:layout_width="match_parent" android:layout_height="wrap_content">
+        <TextView android:id="@+id/tvTitle" android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+            android:textColor="?colorOnSurface" android:ellipsize="end" android:maxLines="2"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+        <TextView android:id="@+id/tvPeers" android:textAppearance="@style/TextAppearance.Material3.LabelMedium"
+            android:textColor="?colorPrimary" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginTop="4dp" android:visibility="gone"/>
+        <TextView android:id="@+id/tvMagnet" android:textSize="11sp" android:textColor="?colorOnSurfaceVariant"
+            android:ellipsize="middle" android:maxLines="1" android:fontFamily="monospace"
+            android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="4dp"/>
+        <LinearLayout android:gravity="center_vertical" android:orientation="horizontal"
+            android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp">
+            <TextView android:id="@+id/tvSite" android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+                android:textColor="?colorPrimary" android:background="@drawable/bg_chip"
+                android:paddingTop="2dp" android:paddingBottom="2dp" android:paddingStart="6dp" android:paddingEnd="6dp"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+            <TextView android:id="@+id/tvDate" android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+                android:textColor="?colorOnSurfaceVariant" android:maxLines="1"
+                android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:layout_marginStart="8dp"/>
+            <TextView android:id="@+id/tvSize" android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+                android:textColor="?colorOnSurfaceVariant"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+        </LinearLayout>
+    </LinearLayout>
+</com.google.android.material.card.MaterialCardView>

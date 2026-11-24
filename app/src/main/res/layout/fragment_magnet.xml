@@ -1,0 +1,40 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:orientation="vertical" android:layout_width="match_parent" android:layout_height="match_parent">
+    <LinearLayout android:gravity="center_vertical" android:orientation="horizontal"
+        android:paddingTop="8dp" android:paddingStart="12dp" android:paddingEnd="12dp"
+        android:layout_width="match_parent" android:layout_height="wrap_content">
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/tilKeyword" android:layout_width="0dp" android:layout_height="wrap_content"
+            android:hint="@string/hint_keyword" android:layout_weight="1"
+            style="@style/Widget.Material3.TextInputLayout.OutlinedBox.Dense">
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/etKeyword" android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:maxLines="1" android:inputType="text" android:imeOptions="actionSearch"/>
+        </com.google.android.material.textfield.TextInputLayout>
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnSearch" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="@string/search" android:insetTop="6dp" android:insetBottom="6dp" android:layout_marginStart="8dp"/>
+    </LinearLayout>
+    <LinearLayout android:gravity="center_vertical" android:orientation="horizontal"
+        android:paddingTop="2dp" android:paddingStart="16dp" android:paddingEnd="12dp"
+        android:layout_width="match_parent" android:layout_height="wrap_content">
+        <TextView android:id="@+id/tvStatus" android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+            android:textColor="?colorOnSurfaceVariant" android:ellipsize="end" android:maxLines="2"
+            android:text="@string/empty_magnet" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"/>
+        <TextView android:id="@+id/tvSites" android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+            android:textColor="?colorOnSurface" android:background="@drawable/bg_chip"
+            android:paddingTop="4dp" android:paddingBottom="4dp" android:paddingStart="8dp" android:paddingEnd="8dp"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+    </LinearLayout>
+    <com.google.android.material.progressindicator.LinearProgressIndicator
+        android:id="@+id/progress" android:visibility="gone" android:layout_width="match_parent"
+        android:layout_height="wrap_content" app:trackCornerRadius="2dp"/>
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rv" android:paddingTop="4dp" android:paddingBottom="72dp" android:clipToPadding="false"
+        android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"/>
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnMore" android:visibility="gone" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:layout_marginBottom="8dp" android:text="@string/loading_more"
+        style="@style/Widget.Material3.Button.TextButton"/>
+</LinearLayout>
