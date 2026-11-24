@@ -141,6 +141,15 @@ Maven 坐标 `org.libtorrent4j:libtorrent4j:2.1.0-39`，原生库在
     改异步线程 + `join(1500)`。
 20. **切播放页/重复点预览会互相抢**：同进程多会话各自监听端口、共用缓存目录，
     旧页 `stop(true)` 会删掉新页正在写的文件。进页先停旧的 + 缓存按 info hash 分目录。
+21. **★ `collectTrackers(magnet).take(6)` 是个隐蔽的顺序 bug**：它返回「magnet 自带的 →
+    兜底」，而老种子自带的十几个 tracker 常常全死（实测一条磁力 15 个 http tracker：
+    ktxp 超时、btfans/3322.org 域名不解析、prq.to 403，一个都不通），`take(6)` 就被
+    死 tracker 占满，**已知可用的兜底 tracker 一个都参与不了探测**，peer 注入为空。
+    修法：`probeTrackers()` 把兜底放最前、再接自带的、去重后截断。
+22. **★ peer 注入不能和 `resume()` 绑在一起等**：探测老种子要 8 秒（死 tracker 超时），
+    而 resume 处只 `join(1_500)` → 探测结果永远迟到，`fetched 24 peers` 但
+    `connect_peer` 一次都没执行过。修法：探测线程置完成标志，**在轮询循环里
+    「探测完成即注入」**，与 resume 时机解耦。
 
 ## 真机验证记录
 

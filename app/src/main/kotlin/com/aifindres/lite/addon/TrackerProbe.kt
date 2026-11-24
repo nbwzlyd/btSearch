@@ -46,7 +46,7 @@ object TrackerProbe {
     fun probe(infoHashHex: String, magnet: String, timeoutMs: Int): IntArray {
         val bestSeed = AtomicInteger(0)
         val bestLeech = AtomicInteger(0)
-        val trackers = collectTrackers(magnet).take(6)
+        val trackers = probeTrackers(magnet, 8)
         val deadline = System.currentTimeMillis() + timeoutMs
         val threads = trackers.map { base ->
             thread(name = "tk", isDaemon = true) {
@@ -75,6 +75,30 @@ object TrackerProbe {
         }
         out.addAll(FALLBACK_TRACKERS)
         return out.toList()
+    }
+
+    /**
+     * 探测用的候选 tracker 列表。
+     *
+     * ⚠️ 顺序很重要（真机踩坑，2026-11）：magnet 自带的 `tr=` 在老种子上经常**全部是死的**
+     * （实测一条老磁力带 15 个 http tracker，ktxp 超时、btfans/3322.org 域名已不解析、
+     * prq.to 返回 403……一个都不通）。如果直接 `collectTrackers(magnet).take(6)`，
+     * 前 6 个全被死 tracker 占满，我们**已知可用**的兜底 tracker 反而一个都参与不了探测，
+     * `fetchPeers` 自然拿不到 peer（表现为注入 0 个 peer、元数据靠运气）。
+     *
+     * 所以这里把兜底放在最前面，再接 magnet 自带的，去重后截断。
+     */
+    internal fun probeTrackers(magnet: String, max: Int = 8): List<String> {
+        val out = LinkedHashSet<String>()
+        val magnetTrs = Regex("[?&]tr=([^&]+)").findAll(magnet).mapNotNull { m ->
+            try {
+                val tr = java.net.URLDecoder.decode(m.groupValues[1], "UTF-8")
+                if (tr.startsWith("http://") || tr.startsWith("https://")) tr else null
+            } catch (e: Exception) { null }
+        }.toList()
+        out.addAll(FALLBACK_TRACKERS)   // 已知可用，优先
+        out.addAll(magnetTrs)           // 站点自带（可能全死）
+        return out.take(max)
     }
 
     /** Single announce; returns [seeders, leechers] or [0, 0]. */
@@ -158,7 +182,7 @@ object TrackerProbe {
      */
     fun fetchPeers(infoHashHex: String, magnet: String, timeoutMs: Int, maxPeers: Int = 40): List<Peer> {
         val out = LinkedHashMap<String, Peer>() // "ip:port" 去重
-        val trackers = collectTrackers(magnet).take(6)
+        val trackers = probeTrackers(magnet, 8)
         val deadline = System.currentTimeMillis() + timeoutMs
         for (base in trackers) {
             if (System.currentTimeMillis() >= deadline) break

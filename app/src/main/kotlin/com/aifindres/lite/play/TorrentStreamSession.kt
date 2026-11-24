@@ -173,7 +173,9 @@ class TorrentStreamSession(
             // ★ TrackerProbe 改异步：原来同步串行打 6 个已死 tracker × 8s 超时，
             //   起播前白等 8.1 秒（实测 10:26:07.334 → 10:26:15.446）。
             val hashForPeers = infoHash(magnet)
+            val probeDone = java.util.concurrent.atomic.AtomicBoolean(false)
             var probePeers: List<TrackerProbe.Peer> = emptyList()
+            val injectedCount = java.util.concurrent.atomic.AtomicInteger(0)
             val probeThread = if (hashForPeers != null) {
                 Thread({
                     try {
@@ -181,6 +183,7 @@ class TorrentStreamSession(
                     } catch (t: Throwable) {
                         Log.w(TAG, "fetchPeers failed: ${t.message}")
                     }
+                    probeDone.set(true)
                     Log.i(TAG, "fetched ${probePeers.size} peers from http trackers (async)")
                 }, "tracker-probe").apply {
                     isDaemon = true
@@ -230,26 +233,29 @@ class TorrentStreamSession(
                         found.resume()
                         resumed = true
                         Log.i(TAG, "torrent resumed, flags=${found.flags?.to_int()}")
-                        // 拿到 handle 后最多等 1.5 秒，拿探测到的 peer 主动连（绕过 tracker）
-                        probeThread?.join(1_500)
-                        val injected = probePeers
-                        if (injected.isNotEmpty()) {
-                            var ok = 0
-                            for (p in injected) {
-                                try {
-                                    found.swig().connect_peer(
-                                        org.libtorrent4j.TcpEndpoint(p.ip, p.port).swig()
-                                    )
-                                    ok++
-                                } catch (t: Throwable) { }
-                            }
-                            Log.i(TAG, "connect_peer issued for $ok/${injected.size} peers")
-                        }
-                        // 再补一次 forceReannounce，双保险
+                        // 注意：**不要**在这里 join 探测线程再注入 peer。
+                        // 老磁力自带十几个死 tracker（ktxp 超时 8s、3322.org 域名不解析、prq.to 403），
+                        // 探测通常要 8 秒才回来，而这里 join 只有 1.5s → 探测结果永远迟到、
+                        // peer 一个都注不进去（实测 fetched 24 peers 但 connect_peer 从未执行）。
+                        // 改为在下面的轮询循环里「探测完成即注入」，见 maybeInjectPeers()。
                         try { found.forceReannounce() } catch (t: Throwable) { }
                     } catch (t: Throwable) {
                         Log.w(TAG, "resume failed", t)
                     }
+                }
+                // 探测一完成就把 peer 主动连上（只做一次），不与 resume 的时机耦合。
+                if (resumed && injectedCount.get() == 0 && probeDone.get() && probePeers.isNotEmpty() && found != null && found.isValid) {
+                    var ok = 0
+                    for (p in probePeers) {
+                        try {
+                            found.swig().connect_peer(
+                                org.libtorrent4j.TcpEndpoint(p.ip, p.port).swig()
+                            )
+                            ok++
+                        } catch (t: Throwable) { }
+                    }
+                    injectedCount.set(ok)
+                    Log.i(TAG, "connect_peer issued for $ok/${probePeers.size} peers (deferred)")
                 }
                 if (tick % 5 == 0) {
                     val diag = try {
