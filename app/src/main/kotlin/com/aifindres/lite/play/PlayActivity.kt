@@ -19,7 +19,10 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import com.aifindres.lite.R
 import java.util.Locale
@@ -206,6 +209,17 @@ class PlayActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- BT + 播放
 
     private fun startTorrent(magnet: String) {
+        // ★ 先清场：切播放页/重复点预览时，旧会话仍在监听另一个端口、且与新的共用缓存目录，
+        //   旧页 stop(true) 会把新页正在写的文件删掉（实测 10:06 / 10:07 两个 session 并存）。
+        try { player?.release() } catch (t: Throwable) { }
+        player = null
+        playerView?.player = null
+        try { server?.stop() } catch (t: Throwable) { }
+        server = null
+        try { session?.stop(true) } catch (t: Throwable) { }
+        session = null
+        playbackReady = false
+
         val sess = TorrentStreamSession(this, magnet)
         session = sess
         setTip("正在连接 BT 网络…")
@@ -248,11 +262,25 @@ class PlayActivity : AppCompatActivity() {
     private fun startPlayback(url: String) {
         if (isFinishing || isDestroyed) return
         try {
-            val exo = ExoPlayer.Builder(this).build()
+            // ★ 必须显式调大读超时：media3 的 DefaultHttpDataSource 默认读超时只有 8 秒，
+            //   而本地服务可能为等一个分片阻塞到 45 秒（PIECE_WAIT_MS）。默认值会导致
+            //   SocketTimeoutException → Source error（表现为「下载在涨、画面全黑」）。
+            val httpFactory = DefaultHttpDataSource.Factory()
+                .setConnectTimeoutMs(15_000)
+                .setReadTimeoutMs(90_000)
+            val dataSourceFactory = DefaultDataSource.Factory(this, httpFactory)
+            val exo = ExoPlayer.Builder(this)
+                .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory))
+                .build()
             player = exo
             playerView?.player = exo
             exo.addListener(object : Player.Listener {
                 override fun onPlaybackStateChanged(state: Int) {
+                    Log.i(
+                        TAG,
+                        "playback state=$state pos=${exo.currentPosition} buffered=${exo.bufferedPosition} " +
+                            "isPlaying=${exo.isPlaying}"
+                    )
                     if (state == Player.STATE_READY) {
                         playbackReady = true
                         progressBar?.visibility = View.GONE
@@ -263,6 +291,11 @@ class PlayActivity : AppCompatActivity() {
                 }
 
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    Log.i(
+                        TAG,
+                        "playback isPlaying=$isPlaying pos=${exo.currentPosition} " +
+                            "buffered=${exo.bufferedPosition} state=${exo.playbackState}"
+                    )
                     btnPlayPause?.setImageResource(if (isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
                     btnPlayPause?.contentDescription = if (isPlaying) "暂停" else "播放"
                     if (isPlaying) showControls() else {

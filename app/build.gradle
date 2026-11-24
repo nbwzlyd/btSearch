@@ -10,8 +10,8 @@ android {
         applicationId 'com.aifindres.lite'
         minSdk 23
         targetSdk 28
-        versionCode 12
-        versionName '2.2'
+        versionCode 13
+        versionName '2.3'
     }
     buildTypes {
         release { minifyEnabled false }

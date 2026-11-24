@@ -8,14 +8,21 @@ import org.libtorrent4j.SessionManager
 import org.libtorrent4j.SessionParams
 import org.libtorrent4j.SettingsPack
 import org.libtorrent4j.Sha1Hash
-import org.libtorrent4j.TorrentFlags
 import org.libtorrent4j.TorrentHandle
 import org.libtorrent4j.TorrentInfo
 import java.io.File
 
 /**
- * 磁力链接「边下边播」会话：jlibtorrent 拉元数据 → 只下最大的视频文件 → 顺序下载。
+ * 磁力链接「边下边播」会话：libtorrent 拉元数据 → 只下最大的视频文件 → 按读者位置分级提权。
  * 播放由 [LocalTorrentServer] 通过本地 HTTP 暴露给 ExoPlayer（支持 Range / 等待分片）。
+ *
+ * 优先级模型（本类核心，详见文档第 4 节）：
+ *  - 视频文件其它分片  DEFAULT(4)；非视频文件 IGNORE(0)
+ *  - 文件第一片        TOP_PRIORITY(7)（唯一 TOP，必须有区分度）
+ *  - 头 3 片 / 尾 8 片 SIX(6)（尾部是 MKV Cues / MP4 moov，播放器打开就要）
+ *  - 读者卡住那一片    TOP_PRIORITY(7)，其后 3 片 SIX(6)、再后 28 片 FIVE(5)
+ *  ⚠️ 不要用 setPieceDeadline 做流式优先级（time-critical 语义，过期即降级 → 卡死）；
+ *  ⚠️ 不要用 SEQUENTIAL_DOWNLOAD flag（与片优先级混用实测乱序）。
  */
 class TorrentStreamSession(
     private val context: Context,
@@ -24,16 +31,68 @@ class TorrentStreamSession(
     companion object {
         private const val TAG = "TorrentStream"
         private const val METADATA_TIMEOUT_MS = 60_000L
-        private const val HEAD_BURST_PIECES = 48
-        /** 播放器读到哪里，就把它前面这么多分片设为「尽快要」（约 4MB 一档 × 4） */
-        private const val STREAM_WINDOW_PIECES = 96
+        /** 文件头（EBML/moov）最先要的片数 */
+        private const val HEAD_CRITICAL_PIECES = 3
+        /** 覆盖 MKV Cues / MP4 moov：8 片 × 8MiB = 64MiB */
+        private const val TAIL_BURST_PIECES = 8
+        /** 读者片 + 后 31 片（256MiB ≈ 1080p Remux 的 ~60 秒） */
+        private const val URGENT_WINDOW_PIECES = 32
         private val VIDEO_EXT = setOf(
             // ⚠️ 不要放 iso：镜像不是视频，ExoPlayer 会报 UnrecognizedInputFormatException
             "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m2ts", "mpg", "mpeg", "rmvb", "3gp"
         )
+        private val FALLBACK_TRACKERS = listOf(
+            "http://tracker.opentrackr.org:1337/announce",
+            "http://open.tracker.cl:1337/announce",
+            "http://nyaa.tracker.wf:7777/announce",
+        )
+
+        /** magnet 里的 info hash（40 hex 或 32 base32→hex），非法返回 null */
+        fun infoHash(magnet: String): String? {
+            val i = magnet.indexOf("btih:")
+            if (i < 0) return null
+            val s = i + 5
+            var e = s
+            while (e < magnet.length && magnet[e].isLetterOrDigit()) e++
+            if (e == s) return null
+            val v = magnet.substring(s, e)
+            return when {
+                v.length == 40 -> v.lowercase()
+                v.length == 32 -> base32ToHex(v)
+                else -> null
+            }
+        }
+
+        private fun base32ToHex(b32: String): String? {
+            val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+            val up = b32.uppercase()
+            val out = ByteArray(20)
+            var buffer = 0L
+            var bits = 0
+            var idx = 0
+            for (c in up) {
+                val v = alphabet.indexOf(c)
+                if (v < 0) return null
+                buffer = (buffer shl 5) or v.toLong()
+                bits += 5
+                if (bits >= 8) {
+                    bits -= 8
+                    out[idx++] = ((buffer shr bits) and 0xFF).toByte()
+                }
+            }
+            if (idx != 20) return null
+            return out.joinToString("") { String.format("%02x", it) }
+        }
     }
 
-    val saveDir = File(context.getExternalFilesDir(null), "torrent_cache").apply { mkdirs() }
+    /** 所有种子的缓存根目录 */
+    private val baseCacheDir = File(context.getExternalFilesDir(null), "torrent_cache")
+
+    /** 按 info hash 隔离的保存目录（多会话并存时不会互相删文件） */
+    val saveDir: File = File(
+        baseCacheDir,
+        infoHash(magnet)?.take(16) ?: ("t" + System.currentTimeMillis().toString(16))
+    ).apply { mkdirs() }
 
     private var session: SessionManager? = null
     private var handle: TorrentHandle? = null
@@ -55,12 +114,23 @@ class TorrentStreamSession(
     @Volatile private var fileOffset: Long = 0
     @Volatile private var pieceLength: Int = 0
     @Volatile private var fileIndex: Int = -1
-    /** 上一次已提过优先级的窗口起点，避免每个请求都 clearPieceDeadlines */
+    /** 视频文件自己的首/末分片（多文件种子时与整块种子的首末不同） */
+    @Volatile private var fileFirst: Int = 0
+    @Volatile private var fileLast: Int = 0
+    @Volatile private var totalPieces: Int = 0
+    /** 上一次已提过优先级的窗口起点，避免同一位置重复设置 */
     @Volatile private var lastPrioritizedStart: Int = -1
+    /** 写日志限流（避免每 900ms 刷屏） */
+    @Volatile private var lastUrgentLog: Long = 0
 
     /** 启动引擎并等元数据（阻塞，必须子线程调用） */
     fun start(): Boolean {
         try {
+            // ★ 起播前清残留：进程被杀后遗留的数据会让 libtorrent 进入 CHECKING_FILES
+            //   （43GB 种子实测 90 秒+），而 libtorrent4j 2.1 没有可用的 resume data 读入 API
+            //   （saveState() 恢复后 torrents=0）。所以直接清掉，牺牲已下载数据换起播速度。
+            clearStaleCache()
+
             val settings = SettingsPack()
             // ★★★ 真机定案（K40，逐档对照得出的唯一正确配置）：
             //  0) 完全用默认 settings                        ✅ 5 秒拿到元数据
@@ -95,51 +165,44 @@ class TorrentStreamSession(
             }
             val sm = SessionManager(false)
             // 注意：AlertListener 的 alert() 跑在 native 线程，跨线程调 swig 对象可能直接 SIGABRT，
-            // 这里不做 alert 诊断，改用轮询 + tracker 端点状态。
+            // 这里不做 alert 诊断，改用轮询 + debugState。
             sm.start(SessionParams(settings))
             session = sm
             Log.i(TAG, "session started, listenEndpoints=${sm.listenEndpoints()}, ifaces=${sm.listenInterfaces()}")
-            // 诊断：App 进程内能否直连 tracker（区分「网络/DNS 被挡」与「libtorrent 不 announce」）
-            try {
-                val u = java.net.URL("http://tracker.opentrackr.org:1337/announce?info_hash=%ed%0f%01%34%75%53%5f%19%b5%41%0d%68%fd%20%f6%27%e4%95%0b%1f&peer_id=-UT1810-0123456789ab&port=6881&uploaded=0&downloaded=0&left=0&compact=1&event=started")
-                val c = u.openConnection() as java.net.HttpURLConnection
-                c.connectTimeout = 10000
-                c.readTimeout = 10000
-                val body = c.inputStream.use { it.readBytes() }
-                Log.i(TAG, "app tracker probe: code=${c.responseCode} len=${body.size} head=${String(body).take(60)}")
-            } catch (t: Throwable) {
-                Log.w(TAG, "app tracker probe failed: ${t.javaClass.simpleName} ${t.message}")
-            }
-            Log.i(TAG, "session started, adding magnet")
+
+            // ★ TrackerProbe 改异步：原来同步串行打 6 个已死 tracker × 8s 超时，
+            //   起播前白等 8.1 秒（实测 10:26:07.334 → 10:26:15.446）。
+            val hashForPeers = infoHash(magnet)
+            var probePeers: List<TrackerProbe.Peer> = emptyList()
+            val probeThread = if (hashForPeers != null) {
+                Thread({
+                    try {
+                        probePeers = TrackerProbe.fetchPeers(hashForPeers, magnet, 8000, 40)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "fetchPeers failed: ${t.message}")
+                    }
+                    Log.i(TAG, "fetched ${probePeers.size} peers from http trackers (async)")
+                }, "tracker-probe").apply {
+                    isDaemon = true
+                    start()
+                }
+            } else null
 
             // 关键做法（桌面 T8 实测有效）：libtorrent 自己 announce 在很多国内网络里出不去
             // （peers 恒 0、元数据永远拿不到），但我们用 OkHttp 手写 announce 是通的（徽章功能就靠它）。
-            // 所以先用 TrackerProbe 抓一轮 compact peers，直接塞进 add_torrent_params.set_peers，
-            // libtorrent 不用请求 tracker 就能连 peer 拉元数据 —— 实测 5 秒内 METADATA。
-            val hashForPeers = infoHash(magnet)
-            val injected = try {
-                if (hashForPeers != null) {
-                    TrackerProbe.fetchPeers(hashForPeers, magnet, 8000, 40)
-                } else emptyList()
-            } catch (t: Throwable) {
-                Log.w(TAG, "fetchPeers failed: ${t.message}")
-                emptyList()
-            }
-            Log.i(TAG, "fetched ${injected.size} peers from http trackers")
-            // add_torrent_params.setPet_peers 在真机上实测无效（日志注入 40 个但 peers 恒 0），
-            // 直接用 SessionManager.download，拿到 handle 后再逐个 connect_peer 主动连（更可靠）。
+            // 拿到 handle 后再用探测结果逐个 connect_peer 主动连（set_peers 在真机上实测无效）。
             sm.download(
                 withFallbackTrackers(magnet),
                 saveDir,
                 org.libtorrent4j.swig.torrent_flags_t()
             )
 
-            val hash = infoHash(magnet) ?: run {
+            val hash = hashForPeers ?: run {
                 failReason = "磁力链接里没有可用的 info hash"
                 return false
             }
             val sha1 = try {
-                sha1FromHex(hash)
+                Sha1Hash.parseHex(hash)
             } catch (t: Throwable) {
                 failReason = "info hash 解析失败"
                 return false
@@ -157,10 +220,8 @@ class TorrentStreamSession(
                 // download() 只清掉了 AUTO_MANAGED，所以必须自己 resume()。
                 if (!resumed && found != null && found.isValid) {
                     try {
-                        // ⚠️ 关键：AUTO_MANAGED 会让队列管理器接管这个 torrent（队列上限/暂停策略），
-                        // 真机上实测它们会把 resume() 的效果抵消掉 → flags 停在 40（含 AUTO_MANAGED），
-                        // 结果 libtorrent 连一个 SYN 都不发（/proc/net/tcp 里没有 SYN_SENT）。
-                        // 桌面成功时 flags 恰好是 8（PAUSED 与 AUTO_MANAGED 都清掉），所以这里两个都清。
+                        // AUTO_MANAGED 会让队列管理器接管 torrent，真机上实测会把 resume() 的效果
+                        // 抵消掉（flags 停在 40），结果 libtorrent 连一个 SYN 都不发。
                         try {
                             found.unsetFlags(org.libtorrent4j.TorrentFlags.AUTO_MANAGED)
                         } catch (t: Throwable) {
@@ -169,7 +230,9 @@ class TorrentStreamSession(
                         found.resume()
                         resumed = true
                         Log.i(TAG, "torrent resumed, flags=${found.flags?.to_int()}")
-                        // resume 之后主动连我们 announce 到的 peer（绕过 tracker）
+                        // 拿到 handle 后最多等 1.5 秒，拿探测到的 peer 主动连（绕过 tracker）
+                        probeThread?.join(1_500)
+                        val injected = probePeers
                         if (injected.isNotEmpty()) {
                             var ok = 0
                             for (p in injected) {
@@ -181,8 +244,6 @@ class TorrentStreamSession(
                                 } catch (t: Throwable) { }
                             }
                             Log.i(TAG, "connect_peer issued for $ok/${injected.size} peers")
-                            // 诊断：同一批 peer 用 Java Socket 直连，判断是「App 出不去」还是「libtorrent 出不去」
-                            com.aifindres.lite.addon.NetDiag.probeTcp(injected.map { it.ip to it.port })
                         }
                         // 再补一次 forceReannounce，双保险
                         try { found.forceReannounce() } catch (t: Throwable) { }
@@ -210,15 +271,6 @@ class TorrentStreamSession(
                                 if (tick == 0) {
                                     for (t in trs) append(" [").append(t.url()).append("]")
                                     try { found.forceReannounce() } catch (e: Throwable) { }
-                                }
-                                // libtorrent4j 2.x 的 AnnounceEndpoint 不再暴露 isWorking/fails/lastError，
-                                // 这里只统计端点数量，够定位「announce 有没有真正发起」。
-                                if (tick % 10 == 0 && trs.isNotEmpty()) {
-                                    try {
-                                        append(" eps=").append(trs.sumOf { it.endpoints().size })
-                                    } catch (e: Throwable) {
-                                        append(" epErr=").append(e.message)
-                                    }
                                 }
                             }
                         }
@@ -272,22 +324,27 @@ class TorrentStreamSession(
             pieceLength = tinfo.pieceLength()
             videoSize = bestSize
             videoFile = File(saveDir, files.filePath(best) ?: "video")
+            totalPieces = tinfo.numPieces()
+            fileFirst = if (pieceLength > 0) (fileOffset / pieceLength).toInt() else 0
+            fileLast = if (pieceLength > 0) {
+                minOf(totalPieces - 1, ((fileOffset + videoSize - 1) / pieceLength).toInt())
+            } else 0
 
-            // 只下这个文件
-            val prios = Array(files.numFiles()) { i -> if (i == best) Priority.TOP_PRIORITY else Priority.IGNORE }
+            // 只下这个文件；视频文件本身用 DEFAULT —— 若整文件设 TOP，全 5000+ 片同档，
+            // 事后对某几片再设 TOP 就没有区分度，picker 退化成随机挑片（实测第 0 片 40 秒都不来）。
+            val prios = Array(files.numFiles()) { i -> if (i == best) Priority.DEFAULT else Priority.IGNORE }
             h.prioritizeFiles(prios)
 
-            // 顺序下载 + 开头分片抢时间
-            try { h.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD) } catch (t: Throwable) {
-                Log.w(TAG, "sequential flag failed: ${t.message}")
-            }
-            if (pieceLength > 0) {
-                val first = (fileOffset / pieceLength).toInt()
-                val total = tinfo.numPieces()
-                val last = minOf(first + HEAD_BURST_PIECES, total - 1)
-                for (p in first..last) {
-                    try { h.setPieceDeadline(p, 1500) } catch (t: Throwable) { }
-                }
+            // 起播头尾提权（不再设 SEQUENTIAL_DOWNLOAD：实测与优先级混用会乱序）
+            if (pieceLength > 0 && fileLast >= fileFirst) {
+                setPriority(fileFirst, fileFirst, Priority.TOP_PRIORITY)
+                setPriority(fileFirst + 1, minOf(fileFirst + HEAD_CRITICAL_PIECES - 1, fileLast), Priority.SIX)
+                val tailFirst = maxOf(fileFirst, fileLast - TAIL_BURST_PIECES + 1)
+                setPriority(tailFirst, fileLast, Priority.SIX)
+                Log.i(
+                    TAG,
+                    "priority burst: head=TOP($fileFirst) head2=SIX tail=SIX($tailFirst..$fileLast) of $totalPieces"
+                )
             }
 
             ready = true
@@ -307,32 +364,101 @@ class TorrentStreamSession(
     }
 
     /**
-     * 播放器请求某段数据时，把这一段（+ 前方窗口）的分片提升为「尽快要」。
+     * 播放器请求某段数据时，把它（以及尾部窗口）提权。
      *
-     * 为什么必须有：MP4 的 moov 常常在文件**末尾**，ExoPlayer 一上来就会发
-     * `Range: bytes=<末尾>-` 的探测请求。而顺序下载模式下末尾分片排在最后，
-     * 不主动提优先级就会一直等到超时 → 播放器报错。
+     * 为什么必须有：MKV 的 Cues、MP4 的 moov 常在文件**末尾**，ExoPlayer 一打开就发
+     * `Range: bytes=<末尾>-` 的探测请求；不主动提优先级就会一直等到超时 → 播放器报错。
      */
     fun prioritizeWindow(offsetInFile: Long, length: Long = 0) {
-        val h = handle ?: return
-        if (pieceLength <= 0) return
+        if (pieceLength <= 0 || handle == null) return
         val first = pieceForFileOffset(offsetInFile)
-        val lastByLen = if (length > 0) pieceForFileOffset(offsetInFile + length) else first
-        val windowStart = first
-        if (windowStart == lastPrioritizedStart) return
-        lastPrioritizedStart = windowStart
-        try {
-            h.clearPieceDeadlines()
-            val total = try { h.torrentFile()?.numPieces() ?: 0 } catch (t: Throwable) { 0 }
-            val end = if (total > 0) minOf(lastByLen + STREAM_WINDOW_PIECES, total - 1)
-                      else lastByLen + STREAM_WINDOW_PIECES
-            for (p in first..end) {
-                try { h.setPieceDeadline(p, 0) } catch (t: Throwable) { }
+        if (first == lastPrioritizedStart) return
+        lastPrioritizedStart = first
+        urgentPiece(first)
+        // 请求落到尾部附近时，把尾部 Cues/moov 再提一次（可能已被后续请求覆盖）
+        val tailFirst = maxOf(fileFirst, fileLast - TAIL_BURST_PIECES + 1)
+        if (first >= tailFirst - 8) setPriority(tailFirst, fileLast, Priority.SIX)
+        Log.i(TAG, "prioritize piece $first (ref=${if (length > 0) "len" else "open"}) fileOffset=$fileOffset")
+    }
+
+    /**
+     * 「边等边加急」：读者正阻塞等这一片，把它设为**唯一 TOP**，其后 3 片 SIX、再后 28 片 FIVE。
+     * 由 [LocalTorrentServer.waitForPiece] 每 ~900ms 调用。
+     */
+    fun urgentPiece(piece: Int) {
+        if (pieceLength <= 0 || handle == null) return
+        val base = piece.coerceIn(fileFirst, maxOf(fileFirst, fileLast))
+        setPriority(base, base, Priority.TOP_PRIORITY)
+        setPriority(base + 1, base + 3, Priority.SIX)
+        setPriority(base + 4, base + URGENT_WINDOW_PIECES - 1, Priority.FIVE)
+    }
+
+    /** 只改指定区间的片优先级；已下载的片跳过；失败日志 2 秒限流。 */
+    private fun setPriority(from: Int, to: Int, prio: Priority) {
+        val h = handle ?: return
+        if (pieceLength <= 0 || to < from) return
+        val a = from.coerceIn(0, maxOf(0, totalPieces - 1))
+        val b = to.coerceIn(a, maxOf(0, totalPieces - 1))
+        var n = 0
+        for (p in a..b) {
+            try {
+                if (h.havePiece(p)) continue
+                h.piecePriority(p, prio)
+                n++
+            } catch (t: Throwable) {
+                val now = System.currentTimeMillis()
+                if (now - lastUrgentLog > 2000) {
+                    lastUrgentLog = now
+                    Log.w(TAG, "piecePriority $p=$prio failed: ${t.message}")
+                }
             }
-            Log.i(TAG, "prioritize window pieces $first..$end (fileOffset=$fileOffset)")
-        } catch (t: Throwable) {
-            Log.w(TAG, "prioritizeWindow failed: ${t.message}")
         }
+        if (n > 0) Log.i(TAG, "priority $prio $a..$b ($n pieces)")
+    }
+
+    /**
+     * 一行诊断（await / have0..15 / haveAwait / nHave / 扫描 have 列表 / peers / seeds / rate / done / state）。
+     * ⚠️ 每次做 O(n) 全分片扫描（5000+ 片），仅供调试，正式版应移除或降频。
+     */
+    fun debugState(awaiting: Int, tag: String): String {
+        val h = handle ?: return "dbg$tag no-handle"
+        return try {
+            val st = h.status()
+            val sb = StringBuilder("dbg$tag await=").append(awaiting)
+            sb.append(" have0..15=")
+            for (p in 0..15) sb.append(if (safeHave(h, p)) '1' else '0')
+            sb.append(" haveAwait=").append(if (safeHave(h, awaiting)) '1' else '0')
+            var nHave = 0
+            val found = ArrayList<Int>()
+            for (p in 0 until totalPieces) {
+                if (safeHave(h, p)) {
+                    nHave++
+                    if (found.size < 20) found.add(p)
+                }
+            }
+            sb.append(" nHave=").append(nHave).append("/").append(totalPieces)
+            sb.append(" 扫描have=").append(found)
+            sb.append(" peers=").append(st.numPeers())
+            sb.append(" seeds=").append(st.numSeeds())
+            sb.append(" rate=").append(humanRate(session?.downloadRate() ?: 0))
+            sb.append(" done=").append(st.totalWantedDone())
+            sb.append(" state=").append(st.state())
+            sb.toString()
+        } catch (t: Throwable) {
+            "dbg$tag err=${t.message}"
+        }
+    }
+
+    private fun safeHave(h: TorrentHandle, p: Int): Boolean = try {
+        h.havePiece(p)
+    } catch (t: Throwable) {
+        false
+    }
+
+    private fun humanRate(bps: Long): String = when {
+        bps >= 1024L * 1024 -> String.format(java.util.Locale.US, "%.1fMB/s", bps / 1024.0 / 1024)
+        bps >= 1024 -> String.format(java.util.Locale.US, "%.0fKB/s", bps / 1024.0)
+        else -> "${bps}B/s"
     }
 
     fun hasPiece(piece: Int): Boolean = try {
@@ -387,94 +513,74 @@ class TorrentStreamSession(
         val finished: Boolean,
     )
 
-    // ---- infohash helpers ----
+    // ---- 缓存 ----
 
     /**
-     * magnet 里如果没带 tracker（或只带 udp:// 的），补上可用的 HTTP tracker。
-     * 本网络 DHT(UDP) 被封，元数据只能靠 HTTP tracker 拿到 peer。
+     * 清掉 torrent_cache 下的所有残留数据。
+     *
+     * 为什么必须：进程被杀后残留数据会让 libtorrent 重新校验全部已有分片
+     * （`state=CHECKING_FILES`，43GB 种子实测 90 秒+，表现是「数据都在却一直转圈」）；
+     * 而 libtorrent4j 2.1 **没有可用的 resume data 读入 API**
+     * （`saveState()` 恢复后 torrents=0；`AddTorrentParams` 只能 writeResumeDataBuf 出去）。
+     * 所以起播前直接删干净，牺牲已下载数据换起播速度。
      */
-    private fun withFallbackTrackers(magnet: String): String {
-        val fallbacks = listOf(
-            "http://tracker.opentrackr.org:1337/announce",
-            "http://open.tracker.cl:1337/announce",
-            "http://nyaa.tracker.wf:7777/announce",
-        )
-        val existingHttp = Regex("[?&]tr=(http[^&]+)").findAll(magnet).count()
-        Log.i(TAG, "magnet has $existingHttp http trackers")
-        if (existingHttp > 0) return magnet
-        val sb = StringBuilder(magnet)
-        for (t in fallbacks) {
-            sb.append("&tr=").append(java.net.URLEncoder.encode(t, "UTF-8"))
-        }
-        return sb.toString()
-    }
-
-    private fun infoHash(magnet: String): String? {
-        val i = magnet.indexOf("btih:")
-        if (i < 0) return null
-        val s = i + 5
-        var e = s
-        while (e < magnet.length && magnet[e].isLetterOrDigit()) e++
-        if (e == s) return null
-        val v = magnet.substring(s, e)
-        return when {
-            v.length == 40 -> v.lowercase()
-            v.length == 32 -> base32ToHex(v)
-            else -> null
-        }
-    }
-
-    private fun base32ToHex(b32: String): String? {
-        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-        val up = b32.uppercase()
-        val out = ByteArray(20)
-        var buffer = 0L
-        var bits = 0
-        var idx = 0
-        for (c in up) {
-            val v = alphabet.indexOf(c)
-            if (v < 0) return null
-            buffer = (buffer shl 5) or v.toLong()
-            bits += 5
-            if (bits >= 8) {
-                bits -= 8
-                out[idx++] = ((buffer shr bits) and 0xFF).toByte()
+    private fun clearStaleCache() {
+        try {
+            val items = baseCacheDir.listFiles() ?: return
+            if (items.isEmpty()) return
+            var total = 0L
+            var count = 0
+            for (f in items) {
+                total += sizeOf(f)
+                count++
+                try { f.deleteRecursively() } catch (t: Throwable) { }
             }
-        }
-        if (idx != 20) return null
-        return out.joinToString("") { String.format("%02x", it) }
-    }
-
-    private fun sha1FromHex(hex: String): Sha1Hash = Sha1Hash.parseHex(hex)
-
-    /**
-     * 取当前默认网络的 IPv4（优先非回环、非链路本地；WiFi 网段优先），
-     * 用来把 libtorrent 的 listen/outgoing 绑到能出网的那张网卡上。
-     */
-    private fun primaryIpv4(): String? {
-        return try {
-            val ifaces = java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())
-            val cands = ArrayList<Pair<String, String>>() // ip to ifaceName
-            for (nif in ifaces) {
-                if (!nif.isUp || nif.isLoopback) continue
-                for (addr in nif.inetAddresses) {
-                    if (addr is java.net.Inet4Address && !addr.isLoopbackAddress && !addr.isLinkLocalAddress) {
-                        cands.add(addr.hostAddress to nif.name)
-                    }
-                }
-            }
-            // 优先 wifi/ap 网段（这些通常才是真正能出网的默认路由）
-            val wifi = cands.firstOrNull { (_, n) ->
-                n.startsWith("wlan") || n.startsWith("ap") || n.startsWith("eth")
-            }
-            val picked = wifi ?: cands.firstOrNull()
-            if (picked == null) null else {
-                Log.i(TAG, "primaryIpv4: ${picked.first} via ${picked.second} (all=${cands.map { it.first }})")
-                picked.first
+            baseCacheDir.mkdirs()
+            saveDir.mkdirs()
+            if (count > 0) {
+                Log.i(TAG, "clearStaleCache: cleared $count item(s), ${total / 1024 / 1024}MB")
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "primaryIpv4 failed: ${t.message}")
-            null
+            Log.w(TAG, "clearStaleCache failed: ${t.message}")
         }
+    }
+
+    private fun sizeOf(f: File): Long {
+        if (f.isFile) return f.length()
+        var sum = 0L
+        f.listFiles()?.forEach { sum += sizeOf(it) }
+        return sum
+    }
+
+    // ---- tracker ----
+
+    /**
+     * 补上可用的 HTTP tracker。
+     *
+     * ⚠️ 恒补而不是「已有 http tracker 就跳过」：实测有磁力自带 19 个 tracker 全是死链
+     * （`nTrackers=19` 全死、`peers=0`），必须有兜底；同一 URL 去重避免重复 announce。
+     * 另外这里顺手把 `&amp;` 还原成 `&`（HtmlParser 旧版本会污染 magnet）。
+     */
+    private fun withFallbackTrackers(magnet: String): String {
+        val base = magnet.trim().replace("&amp;", "&").trimEnd('&')
+        val existing = try {
+            Regex("[?&]tr=([^&]+)").findAll(base)
+                .mapNotNull {
+                    try {
+                        java.net.URLDecoder.decode(it.groupValues[1], "UTF-8").lowercase()
+                    } catch (t: Throwable) { null }
+                }.toSet()
+        } catch (t: Throwable) {
+            emptySet()
+        }
+        val sb = StringBuilder(base)
+        var added = 0
+        for (t in FALLBACK_TRACKERS) {
+            if (existing.contains(t.lowercase())) continue
+            sb.append("&tr=").append(java.net.URLEncoder.encode(t, "UTF-8"))
+            added++
+        }
+        Log.i(TAG, "magnet has ${existing.size} http trackers, added $added fallback")
+        return sb.toString()
     }
 }

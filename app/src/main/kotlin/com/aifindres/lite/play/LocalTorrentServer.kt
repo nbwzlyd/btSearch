@@ -206,17 +206,37 @@ class LocalTorrentServer(private val session: TorrentStreamSession) {
         else -> "application/octet-stream"
     }
 
-    /** 阻塞直到包含该偏移的分片已下载 */
+    /**
+     * 阻塞直到包含该偏移的分片已下载。
+     *
+     * 「边等边加急」：等待期间每 ~900ms 调 [TorrentStreamSession.urgentPiece] 把这一片刷成唯一 TOP，
+     * 否则 libtorrent 的 picker 在同档里随机挑片，读者要的那片可能 40 秒都不来。
+     * 每 ~3 秒打一行 [TorrentStreamSession.debugState] 诊断。
+     *
+     * ⚠️ PIECE_WAIT_MS 必须小于播放器读超时（45s < 90s），否则服务端还在等片、播放器已判定超时。
+     */
     private fun waitForPiece(offsetInFile: Long): Boolean {
         val deadline = System.currentTimeMillis() + PIECE_WAIT_MS
         val piece = session.pieceForFileOffset(offsetInFile)
+        var lastUrgent = 0L
+        var lastDbg = 0L
         while (System.currentTimeMillis() < deadline) {
             if (session.hasPiece(piece)) return true
             // 已下完但分片号算错时也放行（防御）
             val p = session.progress()
             if (p.finished) return true
+            val now = System.currentTimeMillis()
+            if (now - lastUrgent > 900) {
+                lastUrgent = now
+                try { session.urgentPiece(piece) } catch (t: Throwable) { }
+            }
+            if (now - lastDbg > 3000) {
+                lastDbg = now
+                try { Log.i(TAG, session.debugState(piece, " wait")) } catch (t: Throwable) { }
+            }
             try { Thread.sleep(120) } catch (e: InterruptedException) { return false }
         }
+        Log.w(TAG, "waitForPiece gave up: piece=$piece offset=$offsetInFile")
         return false
     }
 }

@@ -122,8 +122,12 @@ object SearchEngine {
         (s ?: "").replace('\u00A0', ' ').replace(Regex("\\s+"), " ").trim()
 
     fun normalizeMagnet(s: String?): String? {
-        if (s.isNullOrEmpty() || !s.startsWith("magnet:")) return null
-        val m = MAGNET_FULL.matcher(s)
+        if (s.isNullOrEmpty()) return null
+        // 兜底：从原始 HTML 文本里正则捞磁力时，`&` 可能还带着 `&amp;` 转义，
+        // 会让后面按 `[?&]tr=` 提 tracker 全部失效（表现为 magnet has 0 http trackers）。
+        val t = if (s.contains("&amp;")) s.replace("&amp;", "&") else s
+        if (!t.startsWith("magnet:")) return null
+        val m = MAGNET_FULL.matcher(t)
         if (!m.find()) return null
         val g = m.group()
         return if (BTIH_RE.matcher(g).find()) g.trim() else null

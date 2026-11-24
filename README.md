@@ -117,20 +117,50 @@ Maven 坐标 `org.libtorrent4j:libtorrent4j:2.1.0-39`，原生库在
     `WindowCompat.setDecorFitsSystemWindows(window, false)` +
     `WindowInsetsControllerCompat.hide(systemBars())`，否则状态栏/导航栏还在。
     退出全屏要成对还原（`SCREEN_ORIENTATION_UNSPECIFIED` + `show(systemBars())`）。
+12. **★ HtmlCleaner 的 `DomSerializer` 会把属性里的 `&` 转义成 `&amp;`**，磁力链接里的
+    `&tr=` 因此被污染，按 `[?&]tr=` 一个 tracker 都提不到（日志 `magnet has 0 http trackers`，
+    元数据永远拿不到）。`HtmlParser.eval()` 必须做实体解码（`unescape`），
+    `SearchEngine.normalizeMagnet()` 也要兜底 replace。
+13. **★ 不要用 `setPieceDeadline()` 做流式优先级**。它的语义是 *time-critical*
+    （"我最晚何时需要这一片"），过期即降级/放弃；只刷新"当前读的那一片"会导致
+    第 1、2 片在 30+ 种子的 swarm 里 12 秒都不到。要用 `piecePriority()` 分级。
+14. **★ 视频文件本身不能用 `TOP_PRIORITY`**。整文件 5000+ 片同一最高档时，
+    同一档内 picker **随机挑片**，事后对某几片再设 TOP 没有区分度 → 第 0 片 40 秒都不来。
+    正确做法：文件 `DEFAULT`，然后分级 —— 读者片唯一 `TOP`、后 3 片 `SIX`、再后 28 片 `FIVE`、
+    头片 `TOP`、尾 8 片 `SIX`。
+15. **`SEQUENTIAL_DOWNLOAD` flag 与片优先级混用实测乱序**（`flags=520` 仍乱序挑片），已弃用。
+16. **media3 `DefaultHttpDataSource` 默认读超时只有 8 秒**，而本地服务等分片最长 45 秒 →
+    必然 `SocketTimeoutException` → `Source error`（现象是「下载在涨、画面全黑」）。
+    必须显式设 connect 15s / read 90s，且保证 `PIECE_WAIT_MS < readTimeout`。
+17. **进程被杀后残留数据会触发 `CHECKING_FILES` 全量校验**（43GB 种子 90 秒+，
+    表现为「数据都在却一直转圈」），而 libtorrent4j 2.1 没有可用的 resume data 读入 API
+    （`saveState()` 恢复后 `torrents=0`）。起播前直接清 `torrent_cache` 换起播速度。
+18. **tracker 不能"有就不补"**：实测磁力自带 19 个 tracker 全是死链，必须恒补兜底
+    （opentrackr / open.tracker.cl / nyaa），同 URL 去重。
+19. **`TrackerProbe.fetchPeers()` 不能同步串行**：6 个死 tracker × 8s 超时 = 起播白等 8 秒。
+    改异步线程 + `join(1500)`。
+20. **切播放页/重复点预览会互相抢**：同进程多会话各自监听端口、共用缓存目录，
+    旧页 `stop(true)` 会删掉新页正在写的文件。进页先停旧的 + 缓存按 info hash 分目录。
 
 ## 真机验证记录
 
-红米 K40（M2012K11AC / Android 13 / MIUI）实测：
+红米 K40（M2012K11AC / Android 13 / MIUI）实测 v2.1：
 - 元数据 5 秒内到手，peer 连接正常；
 - 清空缓存后播放 263MB 的 Big Buck Bunny，**下载到 45% 时画面已经在播**，
   91% / 100% 全程流畅，下载速度峰值 14.9 MB/s；
 - release 包（19MB，含 arm64+v7a 两个 libtorrent4j.so）同样验证通过。
 
-Android 11 x86_64 模拟器（emulator-5554，另带 x86_64 .so 便于本机验证）实测 v2.2：
-- 元数据 1.7 秒到手，画面正常播放；
-- 底部控制条显示 `01:36 / 10:34`、暂停图标随状态切换；
-- 点全屏 → 横屏 + 系统栏隐藏、画面按比例铺满、按钮仍在底部；再点 → 正常竖屏还原；
-- ±10s 与进度条拖动均生效。
+Redmi 24117RK2CC（Android 16 / HyperOS OS3.0.307.0）实测 v2.3（分级优先级 + 实体解码版）：
+- 40GB Oppenheimer Remux（5153 片）第 0 片 25 秒内到、尾部 5151 同时到，
+  `00:14 / 3:00:24` 出画面（改前卡在 `00:03` 不动）；
+- WiFi 原始 134KB/s 时 BT 仍 1.6~2MB/s，每 5~9 秒 `state=2` 缓冲断流 —— 带宽瓶颈，非代码问题。
+
+Android 11 x86_64 模拟器（emulator-5554，另带 x86_64 .so 便于本机验证）实测 v2.3：
+- `clearStaleCache: cleared 3 item(s), 263MB`、元数据 1.3 秒到手、`priority burst: head=TOP(0)
+  head2=SIX tail=SIX(1046..1053) of 1055`、`ready` 后播放器 `state=3`；
+- `dbg wait await=0 have0..15` 从全 0 → 全 1，nHave 从 0 涨到 606/1055，peers 39 / seeds 36，
+  速率 2.6 → 15.1 MB/s，**画面正常出、进度条推进**；
+- 底部控制条 `01:06 / 10:34`、±10s、拖动、全屏进出均正常（v2.2 已验证）。
 
 ## License
 
