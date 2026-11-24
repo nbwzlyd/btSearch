@@ -10,8 +10,8 @@ android {
         applicationId 'com.aifindres.lite'
         minSdk 23
         targetSdk 28
-        versionCode 10
-        versionName '2.0'
+        versionCode 11
+        versionName '2.1'
     }
     buildTypes {
         release { minifyEnabled false }
@@ -51,7 +51,7 @@ dependencies {
     implementation 'net.sourceforge.htmlcleaner:htmlcleaner:2.29'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
     // 边下边播：BT 引擎（.so 已手动解包到 src/main/jniLibs，只留纯 Java API jar）
-    implementation files('libs/jlibtorrent-1.2.0.18.jar')
+    implementation files('libs/libtorrent4j-2.1.0-39.jar')
     // 视频播放器
     implementation 'androidx.media3:media3-exoplayer:1.4.1'
     implementation 'androidx.media3:media3-ui:1.4.1'

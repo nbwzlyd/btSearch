@@ -14,8 +14,8 @@ local.properties
 *.hprof
 captures/
 
-# 冗余的 ABI 版 jlibtorrent jar：里面只有 lib/<abi>/libjlibtorrent-1.2.0.18.so，
-# 与 app/src/main/jniLibs/ 下的 .so 文件完全同源（sha256 一致）。
-# .so 已直接提交在 jniLibs，这两个 jar 不再入库存，避免仓库无谓膨胀。
-app/libs/jlibtorrent-android-arm-1.2.0.18.jar
-app/libs/jlibtorrent-android-arm64-1.2.0.18.jar
+# 冗余的 ABI 版引擎 jar：里面只有 lib/<abi>/*.so，与 jniLibs 下的 .so 完全同源。
+# .so 已直接提交在 jniLibs，这些 jar 不入库，避免仓库无谓膨胀（约 4.7MB/版）。
+app/libs/*-android-arm-*.jar
+app/libs/*-android-arm64-*.jar
+app/libs/*-android-x86_64-*.jar

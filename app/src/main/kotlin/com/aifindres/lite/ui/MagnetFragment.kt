@@ -266,6 +266,12 @@ class MagnetFragment : Fragment(R.layout.fragment_magnet) {
             toast("这条没有磁力链接")
             return
         }
+        // ★ 站点列表页常把 magnet 截断成显示文本（如 btih:D2F6...n%3A8000），
+        // 这种哈希不可用，直接进去会白等 60 秒超时，这里先拦下并给明确提示。
+        if (item.infoHash() == null) {
+            toast("这条磁力链接是截断的，无法预览（换一条试试）")
+            return
+        }
         try {
             startActivity(Intent(requireContext(), PlayActivity::class.java).apply {
                 putExtra(PlayActivity.EXTRA_MAGNET, item.magnet)

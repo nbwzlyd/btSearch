@@ -64,29 +64,56 @@ echo 'sdk.dir=/path/to/Android/sdk' > local.properties
 
 ## 原生库说明
 
-BT 引擎用 [frostwire/jlibtorrent](https://github.com/frostwire/frostwire-jlibtorrent) 1.2.0.18（MIT）。
+BT 引擎用 [libtorrent4j](https://github.com/aldenml/libtorrent4j) **2.1.0-39**（libtorrent 2.1.0.0，MIT）。
+
+> 早期用过 frostwire/jlibtorrent 1.2.0.18，但那个 arm64 构建（2018 年编译）在 Android 上
+> 存在异常（连 TCP listen socket 都建不起来、native 工作线程不起），已整体替换为 libtorrent4j。
 
 AGP **不会**从本地 jar 里提取 `.so`，所以原生库是手动解压后放在 `jniLibs` 的：
 
-- `app/src/main/jniLibs/arm64-v8a/libjlibtorrent-1.2.0.18.so` —— 真机 arm64
-- `app/src/main/jniLibs/armeabi-v7a/libjlibtorrent-1.2.0.18.so` —— 真机 32 位
-- `app/src/debug/jniLibs/x86_64/libjlibtorrent-1.2.0.18.so` —— 仅 debug 包（模拟器验证用）
+- `app/src/main/jniLibs/arm64-v8a/libtorrent4j.so` —— 真机 arm64（16MB）
+- `app/src/main/jniLibs/armeabi-v7a/libtorrent4j.so` —— 真机 32 位（14MB）
+- `app/src/debug/jniLibs/x86_64/libtorrent4j.so` —— 仅 debug 包（模拟器验证用）
 
-Java API 只用 `app/libs/jlibtorrent-1.2.0.18.jar`（纯 Java，无 native）。
+Java API 只用 `app/libs/libtorrent4j-2.1.0-39.jar`（纯 Java，无 native，816KB）。
+Maven 坐标 `org.libtorrent4j:libtorrent4j:2.1.0-39`，原生库在
+`libtorrent4j-android-arm64` / `-android-arm` / `-android-x86_64` 三个包里。
 
-## 边下边播已知的坑（改这块代码前先读）
+## 边下边播已知的坑（改这块代码前先读，全是真机踩出来的）
 
-1. **magnet 加入后 libtorrent 会给 torrent 打 `PAUSED` 标志**，暂停态完全不 announce，
-   表现为 peers 恒 0、永远拿不到元数据。`download()` 只清 `AUTO_MANAGED`，
-   必须自己 `handle.resume()`。
-2. **Android 上 announce 可能不生效**（同代码在桌面正常）。兜底方案：自己用 OkHttp
-   发 HTTP announce 抓 compact peers，再 `add_torrent_params.set_peers()` 注入。
-3. **MP4 的 moov 常在文件尾部**，ExoPlayer 打开时会先请求末尾，而顺序下载把末尾排最后。
+1. **★ 绝对不要设 `outgoing_interfaces`**。在 Android 上把它写成具体本机 IP 后，
+   libtorrent 的出站连接会**全部失效且不报错**：`/proc/net/tcp` 里连 SYN_SENT 都没有、
+   peers 恒 0、永远拿不到元数据。这个坑花了两天才定位（逐档 settings 对照法：
+   0=全默认 ✅ / 仅 utp+tracker ✅ / 仅 listen_interfaces ✅ / **仅 outgoing_interfaces ❌**）。
+   `listen_interfaces` 保持默认双栈通配 `0.0.0.0:6881,[::]:6881` 最稳。
+2. **magnet 加入后 libtorrent 会给 torrent 打 `PAUSED` 标志**，暂停态完全不 announce。
+   `download()` 只清 `AUTO_MANAGED`，必须自己 `handle.resume()`
+   （并 `unsetFlags(AUTO_MANAGED)` 让 flags 从 40 变成 8，与桌面成功态一致）。
+3. **国内网络封非 53 端口 UDP**（实测 UDP 6881 全 timeout，只有 UDP 53 通），而
+   libtorrent 默认 `enable_outgoing_utp=true` 会优先走 uTP(UDP) → 连不上 peer。
+   必须关掉 `enable_outgoing_utp` / `enable_incoming_utp` 强制走 TCP。
+4. **`TorrentStatus.total()` 在 libtorrent 2.x 恒为 0**（1.x 的旧语义已废弃），
+   进度要用 `totalWanted()` / `totalWantedDone()`，并用视频文件大小兜底，
+   否则界面显示「0% · 0 B」。
+5. **MP4 的 moov 常在文件尾部**，ExoPlayer 打开时会先请求末尾，而顺序下载把末尾排最后。
    必须由 HTTP 层调用 `prioritizeWindow()` 把播放器要的窗口提到最前，否则一直等到超时。
-4. **libtorrent 建文件之前 `RandomAccessFile` 会抛 FileNotFoundException**，
+6. **libtorrent 建文件之前 `RandomAccessFile` 会抛 FileNotFoundException**，
    服务启动时要先 `createNewFile()` 占位，读到 0 字节时退避重试。
-5. **`AlertListener.alert()` 跑在 native 线程**，回调里碰 swig 对象会直接 SIGABRT，
-   诊断请用轮询 `TorrentStatus`。
+7. **`AlertListener.alert()` 跑在 native 线程**，回调里碰 swig 对象会直接 SIGABRT；
+   而且 `AlertType` 里有 `swig()==-1` 的项，`modifyListeners` 会抛
+   `ArrayIndexOutOfBoundsException`。诊断请用轮询 `TorrentStatus`。
+8. **列表页的 magnet 常是截断显示文本**（如 `btih:D2F6...n%3A8000`），这种哈希不可用，
+   进播放页只会白等 60 秒超时，入口处要先校验（`MagnetItem.infoHash() == null` 就拦下）。
+9. **不要把 `iso` 当视频扩展名**：ISO 镜像不是视频，ExoPlayer 会报
+   `UnrecognizedInputFormatException`。
+
+## 真机验证记录
+
+红米 K40（M2012K11AC / Android 13 / MIUI）实测：
+- 元数据 5 秒内到手，peer 连接正常；
+- 清空缓存后播放 263MB 的 Big Buck Bunny，**下载到 45% 时画面已经在播**，
+  91% / 100% 全程流畅，下载速度峰值 14.9 MB/s；
+- release 包（19MB，含 arm64+v7a 两个 libtorrent4j.so）同样验证通过。
 
 ## License
 

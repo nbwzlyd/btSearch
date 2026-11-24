@@ -3,17 +3,14 @@ package com.aifindres.lite.play
 import android.content.Context
 import android.util.Log
 import com.aifindres.lite.addon.TrackerProbe
-import com.frostwire.jlibtorrent.AlertListener
-import com.frostwire.jlibtorrent.Priority
-import com.frostwire.jlibtorrent.SessionManager
-import com.frostwire.jlibtorrent.SessionParams
-import com.frostwire.jlibtorrent.SettingsPack
-import com.frostwire.jlibtorrent.Sha1Hash
-import com.frostwire.jlibtorrent.TorrentFlags
-import com.frostwire.jlibtorrent.TorrentHandle
-import com.frostwire.jlibtorrent.TorrentInfo
-import com.frostwire.jlibtorrent.alerts.Alert
-import com.frostwire.jlibtorrent.alerts.AlertType
+import org.libtorrent4j.Priority
+import org.libtorrent4j.SessionManager
+import org.libtorrent4j.SessionParams
+import org.libtorrent4j.SettingsPack
+import org.libtorrent4j.Sha1Hash
+import org.libtorrent4j.TorrentFlags
+import org.libtorrent4j.TorrentHandle
+import org.libtorrent4j.TorrentInfo
 import java.io.File
 
 /**
@@ -31,7 +28,8 @@ class TorrentStreamSession(
         /** 播放器读到哪里，就把它前面这么多分片设为「尽快要」（约 4MB 一档 × 4） */
         private const val STREAM_WINDOW_PIECES = 96
         private val VIDEO_EXT = setOf(
-            "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m2ts", "mpg", "mpeg", "rmvb", "3gp", "iso"
+            // ⚠️ 不要放 iso：镜像不是视频，ExoPlayer 会报 UnrecognizedInputFormatException
+            "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m2ts", "mpg", "mpeg", "rmvb", "3gp"
         )
     }
 
@@ -64,21 +62,33 @@ class TorrentStreamSession(
     fun start(): Boolean {
         try {
             val settings = SettingsPack()
-            // 桌面实测（T7）：显式 listen_interfaces=0.0.0.0:6881 + announce_to_all_trackers/tiers
-            // 后 3 秒就能从 opentrackr 拿到 peers 并收到元数据；默认设置下 announce 迟迟不触发。
+            // ★★★ 真机定案（K40，逐档对照得出的唯一正确配置）：
+            //  0) 完全用默认 settings                        ✅ 5 秒拿到元数据
+            //  1) 只设下面这组（announce/tracker + 关 uTP）  ✅ 正常（当前生产值）
+            //  2) 另加 listen_interfaces=具体 WiFi IP        ✅ 正常（但没必要）
+            //  3) 另加 outgoing_interfaces=具体 WiFi IP      ❌ peers 恒 0，永远拿不到元数据
+            //  ⇒ 绝不能设 outgoing_interfaces：Android 上写死本机 IP 后 libtorrent 的出站
+            //    连接全部无效（/proc/net/tcp 里连 SYN_SENT 都没有），且不报错，极难排查。
+            //  ⇒ listen_interfaces 保持默认双栈通配 0.0.0.0:6881,[::]:6881 最稳。
             try {
-                settings.setString(
-                    com.frostwire.jlibtorrent.swig.settings_pack.string_types.listen_interfaces.swigValue(),
-                    "0.0.0.0:0"
+                // 每个 tracker 都要 announce（元数据阶段只有靠 tracker 找 peer）
+                settings.setBoolean(
+                    org.libtorrent4j.swig.settings_pack.bool_types.announce_to_all_trackers.swigValue(), true
                 )
                 settings.setBoolean(
-                    com.frostwire.jlibtorrent.swig.settings_pack.bool_types.announce_to_all_trackers.swigValue(), true
+                    org.libtorrent4j.swig.settings_pack.bool_types.announce_to_all_tiers.swigValue(), true
                 )
                 settings.setBoolean(
-                    com.frostwire.jlibtorrent.swig.settings_pack.bool_types.announce_to_all_tiers.swigValue(), true
+                    org.libtorrent4j.swig.settings_pack.bool_types.prefer_udp_trackers.swigValue(), false
+                )
+                // 国内网络普遍封非 53 端口 UDP（本项目早期排查 DHT 时实测 UDP 6881 全 timeout），
+                // 而 libtorrent 默认 enable_outgoing_utp=true 会优先走 uTP(UDP) → 连不上 peer。
+                // 关掉 uTP 强制 TCP。
+                settings.setBoolean(
+                    org.libtorrent4j.swig.settings_pack.bool_types.enable_outgoing_utp.swigValue(), false
                 )
                 settings.setBoolean(
-                    com.frostwire.jlibtorrent.swig.settings_pack.bool_types.prefer_udp_trackers.swigValue(), false
+                    org.libtorrent4j.swig.settings_pack.bool_types.enable_incoming_utp.swigValue(), false
                 )
             } catch (t: Throwable) {
                 Log.w(TAG, "apply settings failed", t)
@@ -115,32 +125,14 @@ class TorrentStreamSession(
                 Log.w(TAG, "fetchPeers failed: ${t.message}")
                 emptyList()
             }
-            Log.i(TAG, "injecting ${injected.size} peers from http trackers")
-            if (injected.isNotEmpty()) {
-                try {
-                    val ec = com.frostwire.jlibtorrent.swig.error_code()
-                    val atp = com.frostwire.jlibtorrent.swig.add_torrent_params.parse_magnet_uri(
-                        withFallbackTrackers(magnet), ec
-                    )
-                    if (ec.value() == 0) {
-                        val vec = com.frostwire.jlibtorrent.swig.tcp_endpoint_vector()
-                        for (p in injected) {
-                            try { vec.push_back(com.frostwire.jlibtorrent.TcpEndpoint(p.ip, p.port).swig()) } catch (t: Throwable) { }
-                        }
-                        atp.set_peers(vec)
-                        atp.setSave_path(saveDir.absolutePath)
-                        sm.swig().async_add_torrent(atp)
-                    } else {
-                        Log.w(TAG, "parse_magnet_uri failed: ${ec.message()}")
-                        sm.download(withFallbackTrackers(magnet), saveDir)
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "peer injection failed, fallback to download(): ${t.message}")
-                    sm.download(withFallbackTrackers(magnet), saveDir)
-                }
-            } else {
-                sm.download(withFallbackTrackers(magnet), saveDir)
-            }
+            Log.i(TAG, "fetched ${injected.size} peers from http trackers")
+            // add_torrent_params.setPet_peers 在真机上实测无效（日志注入 40 个但 peers 恒 0），
+            // 直接用 SessionManager.download，拿到 handle 后再逐个 connect_peer 主动连（更可靠）。
+            sm.download(
+                withFallbackTrackers(magnet),
+                saveDir,
+                org.libtorrent4j.swig.torrent_flags_t()
+            )
 
             val hash = infoHash(magnet) ?: run {
                 failReason = "磁力链接里没有可用的 info hash"
@@ -165,9 +157,35 @@ class TorrentStreamSession(
                 // download() 只清掉了 AUTO_MANAGED，所以必须自己 resume()。
                 if (!resumed && found != null && found.isValid) {
                     try {
+                        // ⚠️ 关键：AUTO_MANAGED 会让队列管理器接管这个 torrent（队列上限/暂停策略），
+                        // 真机上实测它们会把 resume() 的效果抵消掉 → flags 停在 40（含 AUTO_MANAGED），
+                        // 结果 libtorrent 连一个 SYN 都不发（/proc/net/tcp 里没有 SYN_SENT）。
+                        // 桌面成功时 flags 恰好是 8（PAUSED 与 AUTO_MANAGED 都清掉），所以这里两个都清。
+                        try {
+                            found.unsetFlags(org.libtorrent4j.TorrentFlags.AUTO_MANAGED)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "unset AUTO_MANAGED failed: ${t.message}")
+                        }
                         found.resume()
                         resumed = true
-                        Log.i(TAG, "torrent resumed, flags=${found.flags()?.to_int()}")
+                        Log.i(TAG, "torrent resumed, flags=${found.flags?.to_int()}")
+                        // resume 之后主动连我们 announce 到的 peer（绕过 tracker）
+                        if (injected.isNotEmpty()) {
+                            var ok = 0
+                            for (p in injected) {
+                                try {
+                                    found.swig().connect_peer(
+                                        org.libtorrent4j.TcpEndpoint(p.ip, p.port).swig()
+                                    )
+                                    ok++
+                                } catch (t: Throwable) { }
+                            }
+                            Log.i(TAG, "connect_peer issued for $ok/${injected.size} peers")
+                            // 诊断：同一批 peer 用 Java Socket 直连，判断是「App 出不去」还是「libtorrent 出不去」
+                            com.aifindres.lite.addon.NetDiag.probeTcp(injected.map { it.ip to it.port })
+                        }
+                        // 再补一次 forceReannounce，双保险
+                        try { found.forceReannounce() } catch (t: Throwable) { }
                     } catch (t: Throwable) {
                         Log.w(TAG, "resume failed", t)
                     }
@@ -184,7 +202,7 @@ class TorrentStreamSession(
                                 append(" peers=").append(st.numPeers())
                                 append(" seeds=").append(st.numSeeds())
                                 append(" done=").append(st.totalDone())
-                                append(" err=").append(st.errorCode()?.value())
+                                append(" err=").append(st.errorCode()?.value)
                             }
                             val trs = try { found.trackers() } catch (e: Throwable) { null }
                             if (trs != null) {
@@ -193,15 +211,11 @@ class TorrentStreamSession(
                                     for (t in trs) append(" [").append(t.url()).append("]")
                                     try { found.forceReannounce() } catch (e: Throwable) { }
                                 }
+                                // libtorrent4j 2.x 的 AnnounceEndpoint 不再暴露 isWorking/fails/lastError，
+                                // 这里只统计端点数量，够定位「announce 有没有真正发起」。
                                 if (tick % 10 == 0 && trs.isNotEmpty()) {
                                     try {
-                                        for (ep in trs[0].endpoints()) {
-                                            append(" ep{work=").append(ep.isWorking())
-                                            append(" fails=").append(ep.fails())
-                                            append(" msg=").append(ep.message())
-                                            append(" err=").append(ep.lastError()?.message())
-                                            append("}")
-                                        }
+                                        append(" eps=").append(trs.sumOf { it.endpoints().size })
                                     } catch (e: Throwable) {
                                         append(" epErr=").append(e.message)
                                     }
@@ -217,8 +231,8 @@ class TorrentStreamSession(
                 if (found != null && found.isValid) {
                     if (found.torrentFile() != null) { h = found; break }
                     val ec = try { found.status().errorCode() } catch (t: Throwable) { null }
-                    if (ec != null && ec.value() != 0) {
-                        failReason = "种子加载失败：${ec.message()}"
+                    if (ec != null && ec.isError) {
+                        failReason = "种子加载失败：${ec.message}"
                         return false
                     }
                 }
@@ -260,7 +274,7 @@ class TorrentStreamSession(
             videoFile = File(saveDir, files.filePath(best) ?: "video")
 
             // 只下这个文件
-            val prios = Array(files.numFiles()) { i -> if (i == best) Priority.SEVEN else Priority.IGNORE }
+            val prios = Array(files.numFiles()) { i -> if (i == best) Priority.TOP_PRIORITY else Priority.IGNORE }
             h.prioritizeFiles(prios)
 
             // 顺序下载 + 开头分片抢时间
@@ -331,9 +345,14 @@ class TorrentStreamSession(
         val h = handle ?: return TorrentProgress(0, videoSize, 0, false)
         return try {
             val st = h.status()
+            // ★ libtorrent 2.x 的 TorrentStatus.total() 实测恒为 0（1.x 的旧语义已废弃），
+            //   必须用 totalWanted()/totalWantedDone()；再兜底到视频文件自身大小。
+            val wanted = st.totalWanted()
+            val total = if (wanted > 0) wanted else videoSize
+            val done = st.totalWantedDone().let { if (it > 0) it else st.totalDone() }
             TorrentProgress(
-                downloaded = st.totalDone(),
-                total = st.total(),
+                downloaded = if (total > 0) minOf(done, total) else done,
+                total = total,
                 rate = session?.downloadRate() ?: 0,
                 finished = st.isFinished || st.isSeeding,
             )
@@ -426,8 +445,36 @@ class TorrentStreamSession(
         return out.joinToString("") { String.format("%02x", it) }
     }
 
-    private fun sha1FromHex(hex: String): Sha1Hash {
-        val bytes = ByteArray(20) { i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
-        return Sha1Hash(bytes)
+    private fun sha1FromHex(hex: String): Sha1Hash = Sha1Hash.parseHex(hex)
+
+    /**
+     * 取当前默认网络的 IPv4（优先非回环、非链路本地；WiFi 网段优先），
+     * 用来把 libtorrent 的 listen/outgoing 绑到能出网的那张网卡上。
+     */
+    private fun primaryIpv4(): String? {
+        return try {
+            val ifaces = java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())
+            val cands = ArrayList<Pair<String, String>>() // ip to ifaceName
+            for (nif in ifaces) {
+                if (!nif.isUp || nif.isLoopback) continue
+                for (addr in nif.inetAddresses) {
+                    if (addr is java.net.Inet4Address && !addr.isLoopbackAddress && !addr.isLinkLocalAddress) {
+                        cands.add(addr.hostAddress to nif.name)
+                    }
+                }
+            }
+            // 优先 wifi/ap 网段（这些通常才是真正能出网的默认路由）
+            val wifi = cands.firstOrNull { (_, n) ->
+                n.startsWith("wlan") || n.startsWith("ap") || n.startsWith("eth")
+            }
+            val picked = wifi ?: cands.firstOrNull()
+            if (picked == null) null else {
+                Log.i(TAG, "primaryIpv4: ${picked.first} via ${picked.second} (all=${cands.map { it.first }})")
+                picked.first
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "primaryIpv4 failed: ${t.message}")
+            null
+        }
     }
 }
